@@ -1,8 +1,8 @@
 // Data access layer — THE ONLY place the UI gets data from.
 //
 // With NEXT_PUBLIC_SUPABASE_* set (see .env.example), everything is read from
-// Supabase. Filled by the browser (ESP32 → BLE → lib/esp32/use-sensor-sync.ts) or by
-// the ESP32 itself over WiFi (/api/ingest). Live viewing on other devices: /watch.
+// Supabase. Filled by the browser connected to the sensor (ESP32 → BLE →
+// lib/esp32/use-sensor-sync.ts). Live viewing on other devices: /watch.
 // Without them, every function returns dummy data from lib/mock-data.ts.
 //
 // Frontend devs: do NOT import lib/mock-data.ts or Supabase directly in components.

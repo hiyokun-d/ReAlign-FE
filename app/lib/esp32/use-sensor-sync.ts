@@ -4,8 +4,6 @@
 // Connects to the sensor, averages the stream into one posture_readings row per
 // interval (default 5 s, so other devices can watch live), tracks the session,
 // and uploads each row right away through the offline outbox.
-// Once the ESP32 has WiFi set up (setupWifi) and reports NET:OK, it uploads by
-// itself through /api/ingest and this hook stops uploading, so rows aren't doubled.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react"
 import {
@@ -17,10 +15,10 @@ import {
 import {
   bluetoothSupported,
   connectSensor,
-  parseNet,
   parsePeers,
-  sendWifiConfig,
-  type NetStatus,
+  PAIR_STEPS,
+  type PairStep,
+  type StepState,
   type SensorConnection,
   type SensorSample,
 } from "@/lib/esp32/ble"
@@ -38,9 +36,15 @@ const enqueue: typeof queueRow = supabaseConfigured ? queueRow : () => {}
 
 export type SensorStatus = "idle" | "connecting" | "connected" | "error"
 export type SyncState = { pending: number; lastSyncedAt: number | null; error: string | null }
-export type WifiSetup = { ssid: string; password: string; serverUrl: string }
 
 const noopSubscribe = () => () => {}
+
+// Connected but silent for this long = flag the "Receiving posture data" step.
+const NO_DATA_MS = 8000
+
+export type PairingState = Record<PairStep, { state: StepState; detail?: string }>
+const freshPairing = (): PairingState =>
+  Object.fromEntries(PAIR_STEPS.map((s) => [s.id, { state: "waiting" }])) as PairingState
 
 function savedInterval() {
   try {
@@ -58,7 +62,8 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
   const [deviceName, setDeviceName] = useState<string | null>(null)
   const [latest, setLatest] = useState<SensorSample | null>(null)
   const [sync, setSync] = useState<SyncState>({ pending: 0, lastSyncedAt: null, error: null })
-  const [net, setNet] = useState<NetStatus>({ state: "unknown" })
+  /** Each pairing step's state, for the checklist on /device. */
+  const [pairing, setPairing] = useState<PairingState>(freshPairing)
   /** Phones/laptops connected to the sensor, this one included (null = old firmware). */
   const [peers, setPeers] = useState<number | null>(null)
   /** Seconds between posture_readings rows (browser and ESP32 alike). */
@@ -70,7 +75,6 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
   }, [])
 
   const connRef = useRef<SensorConnection | null>(null)
-  const netRef = useRef<NetStatus>({ state: "unknown" })
   const aggRef = useRef<IntervalAggregator | null>(null)
   /** Raw samples to /watch viewers while Bluetooth is connected. */
   const liveRef = useRef<LiveBroadcast | null>(null)
@@ -106,6 +110,11 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
   const connect = useCallback(async () => {
     setError(null)
     setStatus("connecting")
+    setPairing(freshPairing())
+    const mark = (step: PairStep, state: StepState, detail?: string) =>
+      setPairing((prev) => ({ ...prev, [step]: { state, detail } }))
+    let gotData = false
+    let noDataTimer: ReturnType<typeof setTimeout> | undefined
     try {
       const userId = supabaseConfigured ? (await ensureUser()).id : "local"
       const sessionId = crypto.randomUUID()
@@ -128,8 +137,7 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
         })
       }
       const saveRow = (row: IntervalRow | null) => {
-        // The ESP32 is uploading over WiFi itself; don't double the rows.
-        if (!row || netRef.current.state === "ok") return
+        if (!row) return
         savedAny = true
         enqueue("posture_readings", row.start, {
           id: crypto.randomUUID(),
@@ -154,28 +162,31 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
       }
 
       const conn = await connectSensor({
+        onProgress: ({ step, state, detail }) => mark(step, state, detail),
         onSample(sample) {
+          if (!gotData) {
+            gotData = true
+            clearTimeout(noDataTimer)
+            mark("data", "done")
+          }
           setLatest(sample)
           liveRef.current?.push(sample)
           saveRow(aggRef.current?.add(sample) ?? null)
         },
         onLine(line) {
           const count = parsePeers(line)
-          if (count !== null) return setPeers(count)
-          const status = parseNet(line)
-          if (!status) return
-          netRef.current = status
-          setNet(status)
+          if (count !== null) setPeers(count)
         },
         onDisconnect() {
+          clearTimeout(noDataTimer)
+          mark("link", "failed", "Disconnected")
+          mark("data", "waiting")
           saveRow(aggRef.current?.flush() ?? null)
           if (savedAny) saveSession(new Date().toISOString())
           aggRef.current = null
           liveRef.current?.stop()
           liveRef.current = null
           connRef.current = null
-          netRef.current = { state: "unknown" }
-          setNet(netRef.current)
           setPeers(null)
           setStatus("idle")
           setLatest(null)
@@ -187,10 +198,9 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
       connRef.current = conn
       setDeviceName(conn.name)
       setStatus("connected")
-      // Same interval on the ESP32's own WiFi upload; ask whether it's already uploading.
-      // (Old firmware just ignores both.)
-      conn.send(`WI=${intervalRef.current}`).catch(() => {})
-      conn.send("WIFI?").catch(() => {})
+      noDataTimer = setTimeout(() => {
+        if (!gotData) mark("data", "failed", "No readings after 8 s")
+      }, NO_DATA_MS)
       if (supabaseConfigured) {
         startLiveBroadcast()
           .then((live) => {
@@ -207,21 +217,6 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
     }
   }, [runFlush])
 
-  /** Gets a device token for this user and sends WiFi + server settings to the ESP32 over BLE. */
-  const setupWifi = useCallback(async ({ ssid, password, serverUrl }: WifiSetup) => {
-    const conn = connRef.current
-    if (!conn) throw new Error("Connect the sensor first.")
-    const res = await fetch("/api/device-token", { method: "POST" })
-    const body = await res.json().catch(() => ({}))
-    if (!res.ok) throw new Error(body.error ?? `Couldn't get a device token (${res.status})`)
-    await sendWifiConfig(conn, {
-      ssid,
-      password,
-      ingestUrl: `${serverUrl.replace(/\/+$/, "")}/api/ingest`,
-      token: body.token,
-    })
-  }, [])
-
   const setIntervalSec = useCallback((sec: number) => {
     intervalRef.current = sec
     setIntervalState(sec)
@@ -230,13 +225,10 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
     } catch {}
     // Close the running interval and continue with the new length.
     switchAggRef.current(sec * 1000)
-    connRef.current?.send(`WI=${sec}`).catch(() => {})
   }, [])
 
   /** Operator: the sensor disconnects every other phone/laptop (firmware KICK command). */
   const kickOthers = useCallback(() => connRef.current?.send("KICK"), [])
-
-  const forgetWifi = useCallback(() => connRef.current?.send("WIFIOFF"), [])
 
   const disconnect = useCallback(() => connRef.current?.disconnect(), [])
   useEffect(
@@ -255,13 +247,11 @@ export function useSensorSync({ onSynced }: { onSynced?: () => void } = {}) {
     deviceName,
     latest,
     sync,
-    net,
+    pairing,
     peers,
     kickOthers,
     intervalSec,
     setIntervalSec,
-    setupWifi,
-    forgetWifi,
     connect,
     disconnect,
     syncNow: runFlush,

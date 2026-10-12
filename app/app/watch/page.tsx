@@ -2,7 +2,7 @@
 // No login: the signed token in the link decides whose readings are shown.
 
 import type { Metadata } from "next";
-import { liveChannelFor, verifyWatchToken } from "@/lib/device-token";
+import { liveChannelFor, verifyWatchToken } from "@/lib/watch-token";
 import { LiveView } from "./live-view";
 
 export const metadata: Metadata = {

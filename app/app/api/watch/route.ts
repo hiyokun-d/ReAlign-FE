@@ -7,7 +7,7 @@
 // send nothing if posture_readings isn't in the supabase_realtime publication.
 // EventSource reconnects by itself if the host cuts the stream (serverless time limits).
 
-import { verifyWatchToken } from "@/lib/device-token";
+import { verifyWatchToken } from "@/lib/watch-token";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 
 const COLUMNS =

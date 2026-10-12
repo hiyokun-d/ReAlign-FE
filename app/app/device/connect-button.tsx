@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/posture/status-badge";
-import { WifiSetup } from "@/app/device/wifi-setup";
+import { PairingSteps } from "@/app/device/pairing-steps";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { READING_INTERVALS } from "@/lib/esp32/aggregate";
@@ -35,6 +35,10 @@ export function ConnectButton() {
         </p>
       )}
       {sensor.error && <p className="text-xs text-destructive">{sensor.error}</p>}
+
+      {(sensor.status !== "idle" || Object.values(sensor.pairing).some((s) => s.state !== "waiting")) && (
+        <PairingSteps pairing={sensor.pairing} />
+      )}
 
       {latest && score !== null && (
         <div className="flex items-center justify-between text-sm tabular-nums">
@@ -86,14 +90,8 @@ export function ConnectButton() {
         </div>
       )}
 
-      {sensor.status === "connected" && (
-        <WifiSetup net={sensor.net} onSave={sensor.setupWifi} onForget={sensor.forgetWifi} />
-      )}
-
       <p className="text-xs text-muted-foreground">
-        {sensor.net.state === "ok"
-          ? "The sensor is uploading over WiFi, so this page doesn't upload."
-          : !sensor.configured
+        {!sensor.configured
           ? "Supabase isn't configured (.env.local), so readings are shown live but not saved."
           : sync.error
             ? `Sync failed, will retry: ${sync.error}`

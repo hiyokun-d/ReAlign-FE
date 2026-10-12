@@ -2,7 +2,7 @@
 
 // Raw sensor samples → Supabase Realtime broadcast → /watch viewers, ~10 per second.
 // Not stored: the database still gets one posture_readings row per interval.
-// The channel name comes from the server (lib/device-token.ts liveChannelFor), so only
+// The channel name comes from the server (lib/watch-token.ts liveChannelFor), so only
 // this owner and people with a watch link know it.
 
 import type { SensorSample } from "@/lib/esp32/ble"
@@ -18,7 +18,7 @@ export type LiveSample = {
   n: number // neck pitch
   br: number // back roll
   nr: number // neck roll
-  m: 0 | 1 // motor buzzing
+  m: 0 | 1 // slouch alert active
 }
 
 export type LiveBroadcast = { push(sample: SensorSample): void; stop(): void }
@@ -41,7 +41,7 @@ export async function startLiveBroadcast(): Promise<LiveBroadcast> {
     push(s) {
       if (!ready || s.at - lastSent < SEND_EVERY_MS) return
       lastSent = s.at
-      const payload: LiveSample = { t: s.at, b: s.back, n: s.neck, br: s.backRoll, nr: s.neckRoll, m: s.motor ? 1 : 0 }
+      const payload: LiveSample = { t: s.at, b: s.back, n: s.neck, br: s.backRoll, nr: s.neckRoll, m: s.alert ? 1 : 0 }
       channel.send({ type: "broadcast", event: LIVE_EVENT, payload })
     },
     stop() {

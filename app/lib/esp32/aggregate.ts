@@ -4,7 +4,7 @@
 import type { SensorSample } from "@/lib/esp32/ble"
 import { scoreFromAngles } from "@/lib/posture"
 
-/** Seconds between posture_readings rows. Same choices as the firmware's WI= command. */
+/** Seconds between posture_readings rows (setting on /device). */
 export const READING_INTERVALS = [1, 5, 10, 30, 60] as const
 export const DEFAULT_READING_INTERVAL = 5
 
@@ -29,7 +29,7 @@ export class IntervalAggregator {
   private roll = 0
   private neck = 0
   private score = 0
-  private motorWasOn = false
+  private alertWasOn = false
   private lastAt = 0
   private slouchMs = 0
 
@@ -46,9 +46,9 @@ export class IntervalAggregator {
     this.roll += s.backRoll
     this.neck += s.neck
     this.score += scoreFromAngles(s.back, s.backRoll)
-    // Slouch time = how long the firmware kept the motor buzzing.
-    if (this.motorWasOn && this.lastAt) this.slouchMs += Math.min(s.at - this.lastAt, MAX_GAP_MS)
-    this.motorWasOn = s.motor
+    // Slouch time = how long the firmware's slouch alert was on.
+    if (this.alertWasOn && this.lastAt) this.slouchMs += Math.min(s.at - this.lastAt, MAX_GAP_MS)
+    this.alertWasOn = s.alert
     this.lastAt = s.at
     return done
   }

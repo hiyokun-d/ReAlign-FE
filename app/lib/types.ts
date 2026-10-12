@@ -30,7 +30,7 @@ export type PostureSession = {
   slouchCount: number
   /** Minutes spent in "good" posture. */
   goodMinutes: number
-  /** How long the vibration motor buzzed (posture_sessions.total_slouch_seconds). */
+  /** How long the slouch alert was on (posture_sessions.total_slouch_seconds). */
   slouchSeconds: number
 }
 

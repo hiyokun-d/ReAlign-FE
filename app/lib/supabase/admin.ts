@@ -1,5 +1,5 @@
-// Service client: bypasses row-level security. Server only, for /api/ingest,
-// where the ESP32 has a device token instead of a Supabase session.
+// Service client: bypasses row-level security. Server only, for /api/watch,
+// where viewers have a watch link instead of the owner's Supabase session.
 
 import "server-only"
 import { createClient } from "@supabase/supabase-js"

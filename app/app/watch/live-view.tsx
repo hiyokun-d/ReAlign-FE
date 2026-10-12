@@ -15,8 +15,7 @@ import type { PostureReading } from "@/lib/types";
 // Two feeds:
 //   /api/watch (Server-Sent Events): stored posture_readings rows (snapshot, then each new one) → chart
 //   Realtime broadcast: raw ~10 Hz samples while the owner's laptop is on Bluetooth → "Right now"
-// When the instant feed goes quiet (ESP32 uploading over WiFi on its own), "Right now"
-// falls back to the newest stored row.
+// When the instant feed goes quiet, "Right now" falls back to the newest stored row.
 
 type Row = { id: string; timestamp: string; avg_pitch_punggung: number; avg_pitch_leher: number; slouch_score: number };
 type Live = PostureReading & { neck: number };
@@ -94,10 +93,10 @@ export function LiveView({ token, channel }: { token: string; channel: string })
   const current = fresh
     ? (() => {
         const score = scoreFromAngles(fresh.b, fresh.br);
-        return { score, status: statusFromScore(score), back: fresh.b, neck: fresh.n, motor: fresh.m === 1 };
+        return { score, status: statusFromScore(score), back: fresh.b, neck: fresh.n, alert: fresh.m === 1 };
       })()
     : latest
-      ? { score: latest.score, status: latest.status, back: latest.pitch, neck: latest.neck, motor: false }
+      ? { score: latest.score, status: latest.status, back: latest.pitch, neck: latest.neck, alert: false }
       : null;
 
   return (
@@ -133,7 +132,7 @@ export function LiveView({ token, channel }: { token: string; channel: string })
                 <StatusBadge status={current.status} />
                 <p className="text-xs text-muted-foreground tabular-nums">
                   back {current.back.toFixed(1)}° · neck {current.neck.toFixed(1)}°
-                  {current.motor && " · buzzing"}
+                  {current.alert && " · slouch alert"}
                 </p>
               </>
             ) : (
