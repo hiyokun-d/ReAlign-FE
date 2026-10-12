@@ -21,7 +21,7 @@ in real time, your history, and the sensor's status.
    (`lib/esp32/use-sensor-sync.ts`), averages each minute and uploads it.
 2. **WiFi → `/api/ingest`.** From `/device`, the user sends WiFi + server URL +
    a signed device token to the ESP32 over Bluetooth. The sensor then uploads by
-   itself (`esp32/test/src/cloud.cpp`) and the browser stops uploading.
+   itself (WiFi upload section of `esp32/test/src/main.cpp`) and the browser stops uploading.
 
 Env vars: see `.env.example`. Either way, the frontend does not need to care.
 See [The golden rule](#the-golden-rule-all-data-goes-through-libdatats).

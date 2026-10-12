@@ -6,18 +6,13 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import type { NetStatus } from "@/lib/esp32/ble";
 import type { WifiSetup as WifiSettings } from "@/lib/esp32/use-sensor-sync";
+import { defaultPublicOrigin, isLocalhostUrl } from "@/lib/public-url";
 
 // Sends WiFi settings to the ESP32 over the Bluetooth link it's already on.
 // After that the sensor uploads by itself, no phone or open tab needed.
 
 const inputClass =
   "h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring";
-
-// The ESP32 can't reach "localhost": that's itself. It needs this computer's LAN address or a deployed URL.
-function defaultServerUrl() {
-  const { origin, hostname } = window.location;
-  return hostname === "localhost" || hostname === "127.0.0.1" ? "" : origin;
-}
 
 export function WifiSetup({
   net,
@@ -30,11 +25,11 @@ export function WifiSetup({
 }) {
   const [ssid, setSsid] = useState("");
   const [password, setPassword] = useState("");
-  const [serverUrl, setServerUrl] = useState(defaultServerUrl);
+  const [serverUrl, setServerUrl] = useState(defaultPublicOrigin);
   const [saving, setSaving] = useState(false);
   const [open, setOpen] = useState(net.state !== "ok");
 
-  const localhostUrl = /\/\/(localhost|127\.0\.0\.1)\b/.test(serverUrl);
+  const localhostUrl = isLocalhostUrl(serverUrl);
 
   async function save(e: React.FormEvent) {
     e.preventDefault();

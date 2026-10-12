@@ -1,12 +1,15 @@
 // History — PLACEHOLDER. Owner: frontend team.
-// TODO: weekly trend chart, session detail view, date picker.
+// Click a session to see its full log of readings (app/history/[id]).
+// TODO: weekly trend chart, date picker.
 
+import Link from "next/link";
 import { FadeIn, Stagger, StaggerItem } from "@/components/motion/fade-in";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { getDailySummaries, getSessions } from "@/lib/data";
+import { formatDuration, sessionSeconds } from "@/lib/format";
 
 export default async function HistoryPage() {
   const [sessions, summaries] = await Promise.all([getSessions(), getDailySummaries()]);
@@ -27,6 +30,7 @@ export default async function HistoryPage() {
           <Stagger className="flex flex-col gap-3">
             {sessions.map((s) => (
               <StaggerItem key={s.id}>
+                <Link href={`/history/${s.id}`} className="block rounded-xl transition-opacity hover:opacity-80">
                 <Card>
                   <CardHeader>
                     <CardTitle className="flex items-center gap-2">
@@ -34,13 +38,15 @@ export default async function HistoryPage() {
                       {s.endedAt === null && <Badge>Live</Badge>}
                     </CardTitle>
                     <CardDescription>
-                      {s.slouchCount} slouches · {s.goodMinutes} min good posture
+                      {formatDuration(sessionSeconds(s.startedAt, s.endedAt))} · {s.slouchCount} min slouching ·{" "}
+                      {s.goodMinutes} min good posture
                     </CardDescription>
                   </CardHeader>
                   <CardContent>
                     <Progress value={s.averageScore} />
                   </CardContent>
                 </Card>
+                </Link>
               </StaggerItem>
             ))}
           </Stagger>

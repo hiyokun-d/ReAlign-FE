@@ -63,6 +63,10 @@ export type Esp32Sample = {
 
 export type LogLine = { id: number; text: string };
 
+// Only one tab per browser should hold the sensor. Same channel name as
+// lib/esp32/ble.ts (can't import it: this folder is sealed).
+const TABS_CHANNEL = "reallign-ble";
+
 export const HISTORY_SIZE = 600; // ~30 s at the firmware's 20 Hz
 const LOG_SIZE = 60;
 
@@ -151,6 +155,12 @@ export function useEsp32() {
     const bluetooth = (navigator as BluetoothNavigator).bluetooth;
     if (!bluetooth) return;
     setError(null);
+    // Ask other tabs to let go of the sensor while the user picks it.
+    if (typeof BroadcastChannel !== "undefined") {
+      const tabs = new BroadcastChannel(TABS_CHANNEL);
+      tabs.postMessage("release");
+      tabs.close();
+    }
 
     let device: BleDevice;
     try {
@@ -165,7 +175,10 @@ export function useEsp32() {
     setStatus("connecting");
     try {
       deviceRef.current = device;
+      const tabs = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(TABS_CHANNEL);
+      if (tabs) tabs.onmessage = (e) => e.data === "release" && device.gatt?.disconnect();
       device.addEventListener("gattserverdisconnected", () => {
+        tabs?.close();
         rxRef.current = null;
         latestRef.current = null;
         setCal(null);

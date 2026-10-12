@@ -4,7 +4,8 @@
 // playground has its own, fuller copy since that folder is sealed).
 // Firmware: esp32/test/src/main.cpp, Nordic UART Service, newline-terminated text:
 //   "back,neck,motor[,backRoll,neckRoll]" at ~20 Hz, anything else is a log line.
-//   "NET:..." lines report the ESP32's own WiFi upload (esp32/test/src/cloud.cpp).
+//   "PEERS:n" = how many phones/laptops are connected to the sensor right now.
+//   "NET:..." lines report the ESP32's own WiFi upload (WiFi upload section of esp32/test/src/main.cpp).
 
 export const ESP32_NAME = "PostureMonitor"
 // Web Bluetooth only accepts lowercase UUIDs.
@@ -79,6 +80,23 @@ export function parseNet(line: string): NetStatus | null {
   return null
 }
 
+/** "PEERS:2" → 2 */
+export function parsePeers(line: string): number | null {
+  const m = /^PEERS:(\d+)$/.exec(line)
+  return m ? Number(m[1]) : null
+}
+
+// Only one tab per browser should hold the sensor. A tab about to connect tells the
+// others to let go (app/demo listens on the same channel name).
+const TABS_CHANNEL = "reallign-ble"
+
+export function releaseOtherTabs() {
+  if (typeof BroadcastChannel === "undefined") return
+  const channel = new BroadcastChannel(TABS_CHANNEL)
+  channel.postMessage("release")
+  channel.close()
+}
+
 export type SensorConnection = {
   name: string
   /** Sends one command. Writes are queued; GATT allows one at a time. */
@@ -86,7 +104,11 @@ export type SensorConnection = {
   disconnect(): void
 }
 
-// One BLE write is 20 bytes with the default MTU; cloud.cpp reassembles "W?=" + "W?+" chunks.
+// Chrome often drops the very first GATT connection ("GATT Server is disconnected.
+// Cannot retrieve services"); trying again almost always works.
+const CONNECT_ATTEMPTS = 3
+
+// One BLE write is 20 bytes with the default MTU; the firmware reassembles "W?=" + "W?+" chunks.
 const CHUNK = 17
 
 export type WifiConfig = { ssid: string; password: string; ingestUrl: string; token: string }
@@ -117,6 +139,8 @@ export async function connectSensor(handlers: {
 }): Promise<SensorConnection | null> {
   const bluetooth = (navigator as BluetoothNavigator).bluetooth
   if (!bluetooth) throw new Error("This browser has no Web Bluetooth. Use Chrome/Edge, or Bluefy on iPhone.")
+  // Other tabs disconnect while the user is picking the device.
+  releaseOtherTabs()
 
   let device: BleDevice
   try {
@@ -128,11 +152,9 @@ export async function connectSensor(handlers: {
     return null // picker closed
   }
 
-  device.addEventListener("gattserverdisconnected", handlers.onDisconnect)
   let rx: BleCharacteristic
   try {
-    const server = await device.gatt!.connect()
-    const service = await server.getPrimaryService(NUS_SERVICE)
+    const service = await connectService(device)
     const tx = await service.getCharacteristic(NUS_TX)
     rx = await service.getCharacteristic(NUS_RX)
 
@@ -154,8 +176,17 @@ export async function connectSensor(handlers: {
     await tx.startNotifications()
   } catch (err) {
     device.gatt?.disconnect()
-    throw err
+    throw new Error(
+      `${(err as Error).message} Close other tabs using the sensor (like /demo), make sure it's powered, and try again.`
+    )
   }
+  // Only now: a drop during the retries above isn't a session ending.
+  const tabs = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(TABS_CHANNEL)
+  if (tabs) tabs.onmessage = (e) => e.data === "release" && device.gatt?.disconnect()
+  device.addEventListener("gattserverdisconnected", () => {
+    tabs?.close()
+    handlers.onDisconnect()
+  })
 
   // writeValue (with response) so each chunk is acknowledged before the next one.
   let queue = Promise.resolve()
@@ -166,4 +197,16 @@ export async function connectSensor(handlers: {
   }
 
   return { name: device.name ?? ESP32_NAME, send, disconnect: () => device.gatt?.disconnect() }
+}
+
+async function connectService(device: BleDevice) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const server = await device.gatt!.connect()
+      return await server.getPrimaryService(NUS_SERVICE)
+    } catch (err) {
+      if (attempt >= CONNECT_ATTEMPTS) throw err
+      await new Promise((resolve) => setTimeout(resolve, 500 * attempt))
+    }
+  }
 }

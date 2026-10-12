@@ -3,7 +3,9 @@
 import { useRouter } from "next/navigation";
 import { StatusBadge } from "@/components/posture/status-badge";
 import { WifiSetup } from "@/app/device/wifi-setup";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { READING_INTERVALS } from "@/lib/esp32/aggregate";
 import { useSensorSync } from "@/lib/esp32/use-sensor-sync";
 import { scoreFromAngles, statusFromScore } from "@/lib/posture";
 
@@ -40,6 +42,47 @@ export function ConnectButton() {
             back {latest.back.toFixed(1)}° · neck {latest.neck.toFixed(1)}° · score {score}
           </span>
           <StatusBadge status={statusFromScore(score)} />
+        </div>
+      )}
+
+      <label className="flex items-center justify-between gap-2 text-sm">
+        <span>Send a reading every</span>
+        <select
+          className="h-8 rounded-md border border-input bg-transparent px-2 text-sm"
+          value={sensor.intervalSec}
+          onChange={(e) => sensor.setIntervalSec(Number(e.target.value))}
+        >
+          {READING_INTERVALS.map((s) => (
+            <option key={s} value={s}>
+              {s} s
+            </option>
+          ))}
+        </select>
+      </label>
+
+      {sensor.status === "connected" && (
+        <div className="flex items-center justify-between gap-2 rounded-lg border p-3">
+          <div className="flex flex-col">
+            <span className="text-sm font-medium">Operator</span>
+            <span className="text-xs text-muted-foreground">
+              {sensor.peers === null
+                ? "Other phones or laptops may be connected to the sensor."
+                : sensor.peers <= 1
+                  ? "Only you are connected to the sensor."
+                  : `${sensor.peers - 1} other device${sensor.peers > 2 ? "s" : ""} connected to the sensor.`}
+            </span>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={sensor.peers !== null && sensor.peers <= 1}
+            onClick={() => {
+              sensor.kickOthers();
+              toast.success("Disconnected everyone else");
+            }}
+          >
+            Disconnect everyone else
+          </Button>
         </div>
       )}
 
