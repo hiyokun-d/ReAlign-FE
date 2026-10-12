@@ -7,6 +7,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Preferences.h>
+#include "cloud.h"
 
 // Objek untuk dua sensor MPU6050
 Adafruit_MPU6050 mpu1; // Sensor 1 (Punggung) -> Alamat I2C: 0x68
@@ -79,10 +80,14 @@ BLECharacteristic *txChar = nullptr;
 bool bleConnected = false;
 bool bleWasConnected = false;
 
-// Perintah dari HP disimpan di sini lalu diproses di loop()
-// (jangan proses di callback BLE karena kalibrasi memakai delay)
-String pendingCmd = "";
-volatile bool cmdReady = false;
+// Perintah dari HP masuk antrean lalu diproses di loop()
+// (jangan proses di callback BLE karena kalibrasi memakai delay).
+// Antrean, bukan satu variabel: pengaturan WiFi dikirim dalam banyak potongan cepat.
+struct CmdItem
+{
+  char text[64];
+};
+QueueHandle_t cmdQueue = nullptr;
 
 bool calibrateSensors(int countdownSec, bool force);
 void setMotor(bool on);
@@ -115,10 +120,9 @@ class RxCallbacks : public BLECharacteristicCallbacks
 {
   void onWrite(BLECharacteristic *chr) override
   {
-    if (cmdReady)
-      return; // Perintah sebelumnya belum diproses
-    pendingCmd = String(chr->getValue().c_str());
-    cmdReady = true;
+    CmdItem item = {};
+    strncpy(item.text, chr->getValue().c_str(), sizeof(item.text) - 1);
+    xQueueSend(cmdQueue, &item, 0); // antrean penuh = perintah dibuang
   }
 };
 
@@ -178,7 +182,9 @@ void setup()
   Wire.begin();
   Wire.setClock(100000); // Menjaga kestabilan I2C
 
+  cmdQueue = xQueueCreate(24, sizeof(CmdItem));
   setupBLE();
+  cloudBegin();
 
   Serial.println("Memulai Inisialisasi Sensor...");
 
@@ -241,8 +247,11 @@ void setMotor(bool on)
 //   ON / OFF -> aktifkan / matikan getaran
 //   BUZZ     -> tes motor getar 0.5 detik
 //   STATUS   -> tampilkan pengaturan saat ini
+//   WS=, WP=, WU=, WT=, WIFI, WIFI?, WIFIOFF -> pengaturan WiFi/upload (lihat cloud.cpp)
 void handleCommand(String cmd)
 {
+  if (cloudHandleCommand(cmd))
+    return;
   cmd.trim();
   cmd.toUpperCase();
   if (cmd.length() == 0)
@@ -322,7 +331,7 @@ void handleCommand(String cmd)
   }
   else
   {
-    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS");
+    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS, WIFI?");
   }
 }
 
@@ -341,12 +350,10 @@ void loop()
   }
   bleWasConnected = bleConnected;
 
-  if (cmdReady)
-  {
-    String cmd = pendingCmd;
-    cmdReady = false;
-    handleCommand(cmd);
-  }
+  CmdItem item;
+  while (xQueueReceive(cmdQueue, &item, 0) == pdTRUE)
+    handleCommand(String(item.text));
+  cloudPoll();
 
   readSensors();
 
@@ -387,6 +394,9 @@ void loop()
     isSlouching = false;
     setMotor(false);
   }
+
+  // Rata-rata per menit untuk diupload lewat WiFi (jika diatur)
+  cloudSample(pitch1, pitch2, roll1, motorOn);
 
   // Kirim data ke HP format CSV: punggung,leher,motor,rollPunggung,rollLeher
   // (format ini langsung bisa digambar di menu Plotter aplikasi Bluefruit Connect)

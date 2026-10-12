@@ -1,6 +1,5 @@
 // Device — PLACEHOLDER. Owner: frontend team (UI) + backend/IoT (connection logic).
-// How the app talks to the ESP32 (Bluetooth vs. cloud) is NOT decided yet.
-// The Connect button only shows a toast for now.
+// The ESP32 talks Bluetooth to this page; ConnectButton syncs it to Supabase.
 
 import { ConnectButton } from "@/app/device/connect-button";
 import { FadeIn } from "@/components/motion/fade-in";
@@ -16,6 +15,18 @@ export default async function DevicePage() {
   return (
     <FadeIn className="flex flex-col gap-6">
       <h1 className="text-2xl font-semibold tracking-tight">Device</h1>
+
+      {!device ? (
+        <Card className="max-w-md">
+          <CardHeader>
+            <CardTitle>No sensor yet</CardTitle>
+            <CardDescription>Turn on your reallign sensor and connect it over Bluetooth.</CardDescription>
+          </CardHeader>
+          <CardFooter>
+            <ConnectButton />
+          </CardFooter>
+        </Card>
+      ) : (
 
       <Card className="max-w-md">
         <CardHeader>
@@ -42,6 +53,7 @@ export default async function DevicePage() {
           <ConnectButton />
         </CardFooter>
       </Card>
+      )}
     </FadeIn>
   );
 }

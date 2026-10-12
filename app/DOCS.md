@@ -15,10 +15,16 @@ in real time, your history, and the sensor's status.
 | Backend / data | `lib/data.ts` (+ whatever comes next) | Backend |
 | Frontend (this guide) | `app/`, `components/` | Frontend team |
 
-**Not decided yet:** how data gets from the sensor to the app. Options are
-**Supabase** (sensor → cloud → app) or **Bluetooth** straight to the browser,
-stored locally with **Dexie.js** (IndexedDB). Either way, the frontend does
-not need to care. See [The golden rule](#the-golden-rule-all-data-goes-through-libdatats).
+**How data gets to Supabase** (tables `posture_sessions`, `posture_readings`):
+
+1. **Bluetooth → browser.** `/device` connects over Web Bluetooth
+   (`lib/esp32/use-sensor-sync.ts`), averages each minute and uploads it.
+2. **WiFi → `/api/ingest`.** From `/device`, the user sends WiFi + server URL +
+   a signed device token to the ESP32 over Bluetooth. The sensor then uploads by
+   itself (`esp32/test/src/cloud.cpp`) and the browser stops uploading.
+
+Env vars: see `.env.example`. Either way, the frontend does not need to care.
+See [The golden rule](#the-golden-rule-all-data-goes-through-libdatats).
 
 ---
 

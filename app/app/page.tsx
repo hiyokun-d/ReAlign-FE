@@ -15,13 +15,15 @@ export default async function DashboardPage() {
     getRecentReadings(60),
     getDailySummaries(),
   ]);
-  const today = summaries[summaries.length - 1];
+  const today = summaries.at(-1);
 
   return (
     <div className="flex flex-col gap-6">
       <FadeIn>
         <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
-        <p className="text-sm text-muted-foreground">Dummy data — real sensor data coming soon.</p>
+        <p className="text-sm text-muted-foreground">
+          {latest ? "Synced from your sensor." : "No data yet. Connect your sensor on the Device page."}
+        </p>
       </FadeIn>
 
       <Stagger className="grid gap-4 md:grid-cols-3">
@@ -32,11 +34,17 @@ export default async function DashboardPage() {
               <CardDescription>Latest reading from the sensor</CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col items-center gap-3">
-              <ScoreRing score={latest.score} />
-              <StatusBadge status={latest.status} />
-              <p className="text-xs text-muted-foreground tabular-nums">
-                pitch {latest.pitch}° · roll {latest.roll}°
-              </p>
+              {latest ? (
+                <>
+                  <ScoreRing score={latest.score} />
+                  <StatusBadge status={latest.status} />
+                  <p className="text-xs text-muted-foreground tabular-nums">
+                    pitch {latest.pitch}° · roll {latest.roll}°
+                  </p>
+                </>
+              ) : (
+                <p className="text-sm text-muted-foreground">No readings yet</p>
+              )}
             </CardContent>
           </Card>
         </StaggerItem>
@@ -54,13 +62,13 @@ export default async function DashboardPage() {
         </StaggerItem>
 
         <StaggerItem>
-          <Stat label="Average today" value={today.averageScore} />
+          <Stat label="Average today" value={today?.averageScore ?? 0} />
         </StaggerItem>
         <StaggerItem>
-          <Stat label="Slouches today" value={today.slouchCount} />
+          <Stat label="Slouches today" value={today?.slouchCount ?? 0} />
         </StaggerItem>
         <StaggerItem>
-          <Stat label="Minutes tracked" value={today.trackedMinutes} />
+          <Stat label="Minutes tracked" value={today?.trackedMinutes ?? 0} />
         </StaggerItem>
       </Stagger>
     </div>
