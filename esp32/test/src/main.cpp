@@ -7,17 +7,22 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <Preferences.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <time.h>
 
 // Objek untuk dua sensor MPU6050
 Adafruit_MPU6050 mpu1; // Sensor 1 (Punggung) -> Alamat I2C: 0x68
 Adafruit_MPU6050 mpu2; // Sensor 2 (Leher)    -> Alamat I2C: 0x69
 
-// Pin untuk Modul Motor Getar
-const int motorPin = 18;
+// Pin output
+const int buzzerPin = 18;   // Buzzer: peringatan postur (default MATI, nyalakan dengan ON)
+const int ledRedPin = 4;    // LED merah: belum tersambung Bluetooth
+const int ledGreenPin = 23; // LED hijau: tersambung Bluetooth
+
+// Buzzer aktif (berbunyi cukup dengan HIGH). Jika buzzer pasif, ubah jadi true (pakai tone()).
+const bool BUZZER_PASSIVE = false;
+const int BUZZER_TONE_HZ = 2000;
+// Pola bunyi saat bungkuk: 200 ms bunyi, 800 ms diam
+const unsigned long BEEP_PERIOD_MS = 1000;
+const unsigned long BEEP_ON_MS = 200;
 
 // Variabel untuk menyimpan sudut kemiringan saat ini
 // pitch = condong depan/belakang, roll = miring kiri/kanan (keduanya dari gravitasi)
@@ -68,8 +73,12 @@ float slouchThreshold = 20.0;             // Jika miring lebih dari 20 derajat d
 unsigned long slouchDurationLimit = 3000; // Harus bungkuk selama 3 detik baru bergetar
 unsigned long slouchStartTime = 0;
 bool isSlouching = false;
-bool alertEnabled = true; // Getaran bisa dimatikan dari HP
-bool motorOn = false;
+// alertActive = sedang bungkuk melewati batas waktu (dikirim ke aplikasi, selalu dihitung).
+// buzzerEnabled = buzzer boleh bunyi atau tidak. Default MATI; nyalakan dengan perintah ON.
+bool alertActive = false;
+bool buzzerEnabled = false;
+bool buzzerOn = false;
+unsigned long buzzTestUntil = 0; // perintah BUZZ: bunyi tes sampai waktu ini
 
 // --- BLE: Nordic UART Service (NUS) ---
 // Didukung oleh aplikasi: Adafruit Bluefruit Connect, Serial Bluetooth Terminal, nRF Connect
@@ -93,7 +102,7 @@ portMUX_TYPE peerMux = portMUX_INITIALIZER_UNLOCKED;
 
 // Perintah dari HP masuk antrean lalu diproses di loop()
 // (jangan proses di callback BLE karena kalibrasi memakai delay).
-// Antrean, bukan satu variabel: pengaturan WiFi dikirim dalam banyak potongan cepat.
+// Antrean, bukan satu variabel: beberapa perintah bisa datang beruntun dengan cepat.
 struct CmdItem
 {
   char text[64];
@@ -103,7 +112,11 @@ uint16_t cmdFrom = NO_PEER; // pengirim perintah yang sedang diproses
 QueueHandle_t cmdQueue = nullptr;
 
 bool calibrateSensors(int countdownSec, bool force);
-void setMotor(bool on);
+void setAlert(bool on);
+void updateBuzzer();
+void updateLeds();
+void setLeds(bool red, bool green);
+void blinkErrorForever();
 void loadBaseline();
 void saveBaseline();
 void setForward();
@@ -117,12 +130,6 @@ float wrap180(float deg);
 void bleSend(const String &msg);
 void logMsg(const String &msg);
 void handleCommand(String cmd);
-
-// WiFi upload (lihat bagian paling bawah file ini)
-void cloudBegin();                                                     // panggil di setup()
-void cloudSample(float back, float neck, float backRoll, bool motor);  // panggil tiap loop
-bool cloudHandleCommand(const String &cmd);                            // true jika perintah WiFi
-void cloudPoll();                                                      // kirim NET:... jika status berubah
 
 class ServerCallbacks : public BLEServerCallbacks
 {
@@ -243,15 +250,19 @@ void logMsg(const String &msg)
 void setup()
 {
   Serial.begin(115200);
-  pinMode(motorPin, OUTPUT);
-  digitalWrite(motorPin, LOW);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  pinMode(ledRedPin, OUTPUT);
+  pinMode(ledGreenPin, OUTPUT);
+  setLeds(true, true); // tes LED saat nyala
+  delay(300);
+  setLeds(true, false);
 
   Wire.begin();
   Wire.setClock(100000); // Menjaga kestabilan I2C
 
   cmdQueue = xQueueCreate(24, sizeof(CmdItem));
   setupBLE();
-  cloudBegin();
 
   Serial.println("Memulai Inisialisasi Sensor...");
 
@@ -259,10 +270,7 @@ void setup()
   if (!mpu1.begin(0x68))
   {
     Serial.println("GAGAL: Sensor Punggung (0x68) tidak ditemukan!");
-    while (1)
-    {
-      delay(10);
-    }
+    blinkErrorForever();
   }
   Serial.println("OK: Sensor Punggung Ditemukan!");
 
@@ -270,10 +278,7 @@ void setup()
   if (!mpu2.begin(0x69))
   {
     Serial.println("GAGAL: Sensor Leher (0x69) tidak ditemukan!");
-    while (1)
-    {
-      delay(10);
-    }
+    blinkErrorForever();
   }
   Serial.println("OK: Sensor Leher Ditemukan!");
 
@@ -298,10 +303,69 @@ void setup()
   }
 }
 
-void setMotor(bool on)
+// ── Peringatan postur & buzzer ──────────────────────────────────────────────
+void setAlert(bool on)
 {
-  motorOn = on;
-  digitalWrite(motorPin, on ? HIGH : LOW);
+  alertActive = on;
+  updateBuzzer();
+}
+
+void writeBuzzer(bool on)
+{
+  if (on == buzzerOn)
+    return;
+  buzzerOn = on;
+  if (BUZZER_PASSIVE)
+  {
+    if (on)
+      tone(buzzerPin, BUZZER_TONE_HZ);
+    else
+      noTone(buzzerPin);
+  }
+  else
+  {
+    digitalWrite(buzzerPin, on ? HIGH : LOW);
+  }
+}
+
+// Dipanggil tiap loop: bunyi berpola saat bungkuk (jika diaktifkan), atau bunyi tes BUZZ
+void updateBuzzer()
+{
+  unsigned long now = millis();
+  bool testing = (long)(buzzTestUntil - now) > 0;
+  bool beeping = buzzerEnabled && alertActive && (now % BEEP_PERIOD_MS) < BEEP_ON_MS;
+  writeBuzzer(testing || beeping);
+}
+
+// ── LED status Bluetooth ────────────────────────────────────────────────────
+//   merah berkedip pelan  = menunggu HP/laptop tersambung
+//   hijau menyala         = tersambung
+//   merah + hijau menyala = sedang kalibrasi
+//   merah berkedip cepat  = sensor MPU6050 tidak ditemukan (cek kabel)
+void setLeds(bool red, bool green)
+{
+  digitalWrite(ledRedPin, red ? HIGH : LOW);
+  digitalWrite(ledGreenPin, green ? HIGH : LOW);
+}
+
+void updateLeds()
+{
+  if (peerCount > 0)
+    setLeds(false, true);
+  else
+    setLeds((millis() / 500) % 2 == 0, false);
+}
+
+void blinkErrorForever()
+{
+  writeBuzzer(false);
+  while (1)
+  {
+    setLeds(true, false);
+    delay(100);
+    setLeds(false, false);
+    delay(100);
+  }
 }
 
 // Daftar perintah dari HP (kirim sebagai teks):
@@ -311,15 +375,13 @@ void setMotor(bool on)
 //   RGT      -> miringkan badan + kepala ke KANAN lalu kirim: miring kanan jadi positif
 //   T=25     -> ubah ambang batas sudut (derajat)
 //   D=5000   -> ubah durasi bungkuk sebelum getar (ms)
-//   ON / OFF -> aktifkan / matikan getaran
-//   BUZZ     -> tes motor getar 0.5 detik
+//   ON / OFF -> nyalakan / matikan buzzer peringatan (default MATI)
+//   BUZZ     -> tes buzzer 0.5 detik (bunyi walau buzzer dimatikan)
 //   STATUS   -> tampilkan pengaturan saat ini
 //   KICK     -> putuskan semua HP/laptop lain yang tersambung (selain pengirim)
-//   WS=, WP=, WU=, WT=, WIFI, WIFI?, WIFIOFF -> pengaturan WiFi/upload (lihat bagian WiFi upload di bawah)
+// Semua perintah juga bisa diketik di Serial Monitor (lewat kabel USB).
 void handleCommand(String cmd)
 {
-  if (cloudHandleCommand(cmd))
-    return;
   cmd.trim();
   cmd.toUpperCase();
   if (cmd.length() == 0)
@@ -373,21 +435,20 @@ void handleCommand(String cmd)
   }
   else if (cmd == "ON")
   {
-    alertEnabled = true;
-    logMsg("Getaran: ON");
+    buzzerEnabled = true;
+    logMsg("Buzzer: ON");
   }
   else if (cmd == "OFF")
   {
-    alertEnabled = false;
-    setMotor(false);
-    logMsg("Getaran: OFF");
+    buzzerEnabled = false;
+    updateBuzzer();
+    logMsg("Buzzer: OFF");
   }
   else if (cmd == "BUZZ")
   {
-    setMotor(true);
-    delay(500);
-    setMotor(false);
-    logMsg("Tes motor selesai");
+    buzzTestUntil = millis() + 500; // tanpa delay, loop jalan terus
+    updateBuzzer();
+    logMsg("Tes buzzer");
   }
   else if (cmd == "KICK")
   {
@@ -396,14 +457,14 @@ void handleCommand(String cmd)
   else if (cmd == "STATUS")
   {
     logMsg("T=" + String(slouchThreshold, 1) + " D=" + String(slouchDurationLimit) +
-           " Getar=" + (alertEnabled ? "ON" : "OFF") +
+           " Buzzer=" + (buzzerEnabled ? "ON" : "OFF") +
            " Nol=" + String(baselinePitch1, 1) + "," + String(baselinePitch2, 1) +
            " Arah=" + String(dir1) + "," + String(dir2) +
            " ArahR=" + String(rdir1) + "," + String(rdir2));
   }
   else
   {
-    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS, KICK, WIFI?");
+    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS, KICK");
   }
 }
 
@@ -432,7 +493,27 @@ void loop()
     cmdFrom = item.from;
     handleCommand(String(item.text));
   }
-  cloudPoll();
+
+  // Perintah juga bisa lewat kabel USB (Serial Monitor, 115200, akhiri dengan Enter).
+  // Berguna saat BLE bermasalah, mis. kirim STATUS atau KICK.
+  static String serialLine;
+  while (Serial.available())
+  {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r')
+    {
+      if (serialLine.length())
+      {
+        cmdFrom = NO_PEER;
+        handleCommand(serialLine);
+        serialLine = "";
+      }
+    }
+    else if (serialLine.length() < 63)
+    {
+      serialLine += c;
+    }
+  }
 
   readSensors();
 
@@ -461,25 +542,26 @@ void loop()
     }
     else
     {
-      if (alertEnabled && !motorOn && millis() - slouchStartTime > slouchDurationLimit)
+      // Peringatan selalu dihitung (untuk data di aplikasi); buzzer hanya bunyi jika ON
+      if (!alertActive && millis() - slouchStartTime > slouchDurationLimit)
       {
         logMsg("PERINGATAN: Postur memburuk!");
-        setMotor(true);
+        setAlert(true);
       }
     }
   }
   else
   {
     isSlouching = false;
-    setMotor(false);
+    setAlert(false);
   }
+  updateBuzzer();
+  updateLeds();
 
-  // Rata-rata per interval (default 5 detik) untuk diupload lewat WiFi (jika diatur)
-  cloudSample(pitch1, pitch2, roll1, motorOn);
-
-  // Kirim data ke HP format CSV: punggung,leher,motor,rollPunggung,rollLeher
+  // Kirim data ke HP format CSV: punggung,leher,peringatan,rollPunggung,rollLeher
+  // (kolom ke-3 = 1 saat peringatan bungkuk aktif, walau buzzer dimatikan)
   // (format ini langsung bisa digambar di menu Plotter aplikasi Bluefruit Connect)
-  bleSend(String(pitch1, 1) + "," + String(pitch2, 1) + "," + String(motorOn ? 1 : 0) + "," +
+  bleSend(String(pitch1, 1) + "," + String(pitch2, 1) + "," + String(alertActive ? 1 : 0) + "," +
           String(roll1, 1) + "," + String(roll2, 1) + "\n");
 
   delay(LOOP_MS);
@@ -626,8 +708,9 @@ void setRight()
 //   CAL:FAIL x       bergerak x derajat, titik nol lama dipakai
 bool calibrateSensors(int countdownSec, bool force)
 {
-  setMotor(false);
+  setAlert(false);
   isSlouching = false;
+  setLeds(true, true); // merah + hijau = sedang kalibrasi (loop berhenti selama ini)
 
   for (int s = countdownSec; s > 0; s--)
   {
@@ -691,424 +774,3 @@ bool calibrateSensors(int countdownSec, bool force)
   logMsg("CAL:OK " + String(baselinePitch1, 1) + "," + String(baselinePitch2, 1));
   return true;
 }
-
-// =====================================================================
-// WiFi upload ke server (Next.js /api/ingest -> Supabase)
-// =====================================================================
-namespace reallign_net
-{
-// ── Pengaturan dari HP lewat BLE ────────────────────────────────────────────
-// Satu tulisan BLE maksimal 20 byte, jadi nilai panjang dikirim bertahap:
-//   WS=<awal>  WS+<lanjutan>   nama WiFi (SSID)
-//   WP=...     WP+...          password WiFi
-//   WU=...     WU+...          URL server, mis. https://app.vercel.app/api/ingest
-//   WT=...     WT+...          token perangkat (dari /api/device-token)
-//   WI=5                       jarak antar data posture_readings (detik, 1-60, default 5)
-//   WIFI                       simpan ke flash lalu sambungkan
-//   WIFI?                      laporkan status sekarang
-//   WIFIOFF                    hapus pengaturan WiFi
-//
-// Status dikirim ke HP (lihat app/lib/esp32/ble.ts):
-//   NET:OFF | NET:CONNECTING | NET:OK <ip> | NET:FAIL wifi | NET:FAIL http <kode>
-
-struct NetConfig
-{
-  String ssid, pass, url, token;
-};
-static NetConfig draft; // sedang diisi dari BLE (hanya task loop)
-
-enum NetState
-{
-  NET_OFF,
-  NET_CONNECTING,
-  NET_OK,
-  NET_WIFI_FAIL,
-  NET_HTTP_FAIL
-};
-static volatile NetState netState = NET_OFF;
-static volatile int httpCode = 0;
-static volatile bool reloadConfig = true;
-static String reported = "";
-static bool forceReport = false;
-
-// ── Rata-rata per interval (sama seperti app/lib/esp32/aggregate.ts) ───────
-// Default 5 detik supaya perangkat lain bisa memantau hampir real-time.
-const uint16_t DEFAULT_INTERVAL = 5;
-static volatile uint16_t intervalSec = DEFAULT_INTERVAL;
-
-struct Bucket
-{
-  uint32_t start; // detik unix awal interval
-  uint16_t len;   // panjang interval (detik)
-  float back, neck;
-  uint8_t score;
-  uint32_t slouchMs;
-};
-static QueueHandle_t bucketQueue = nullptr;
-
-static uint32_t curBucket = 0;
-static uint16_t curLen = 0;
-static int n = 0;
-static float sumBack = 0, sumNeck = 0, sumScore = 0;
-static unsigned long slouchMs = 0, lastMs = 0;
-static bool motorWas = false;
-const unsigned long MAX_GAP_MS = 1000;
-
-// Skor 0-100, makin tinggi makin baik (sama dengan lib/posture.ts)
-static float scoreFromAngles(float pitch, float roll)
-{
-  float s = 100 - fabsf(pitch) * 1.8f - fabsf(roll) * 2;
-  return roundf(constrain(s, 0, 100));
-}
-
-static bool clockReady()
-{
-  return time(nullptr) > 1700000000; // sudah dapat jam dari NTP
-}
-
-void sample(float back, float neck, float backRoll, bool motor)
-{
-  if (!bucketQueue || !clockReady())
-    return; // tanpa jam, data tidak bisa diberi waktu
-
-  uint16_t len = intervalSec;
-  uint32_t bucket = time(nullptr) / len;
-  if ((bucket != curBucket || len != curLen) && n > 0)
-  {
-    Bucket b = {curBucket * curLen, curLen, sumBack / n, sumNeck / n, (uint8_t)roundf(sumScore / n), slouchMs};
-    xQueueSend(bucketQueue, &b, 0); // antrean penuh = data dibuang
-    n = 0;
-    sumBack = sumNeck = sumScore = 0;
-    slouchMs = 0;
-  }
-  curBucket = bucket;
-  curLen = len;
-
-  n++;
-  sumBack += back;
-  sumNeck += neck;
-  sumScore += scoreFromAngles(back, backRoll);
-  // Waktu bungkuk = lama motor bergetar
-  unsigned long ms = millis();
-  if (motorWas && lastMs)
-    slouchMs += min(ms - lastMs, MAX_GAP_MS);
-  motorWas = motor;
-  lastMs = ms;
-}
-
-// ── Task upload (core 0, supaya loop sensor tidak tertahan oleh HTTP) ──────
-const int BUF_SIZE = 600; // saat offline: 50 menit pada interval 5 detik
-const int MAX_PER_POST = 60;
-const unsigned long RETRY_MS = 15000;
-
-struct Pending
-{
-  Bucket b;
-  char id[37];
-};
-static Pending pending[BUF_SIZE];
-static int pendingCount = 0;
-
-static void uuid(char *out)
-{
-  uint8_t b[16];
-  for (int i = 0; i < 16; i += 4)
-  {
-    uint32_t r = esp_random();
-    memcpy(b + i, &r, 4);
-  }
-  b[6] = (b[6] & 0x0F) | 0x40; // versi 4
-  b[8] = (b[8] & 0x3F) | 0x80;
-  sprintf(out, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-          b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
-}
-
-static String iso(uint32_t t)
-{
-  time_t tt = t;
-  struct tm tm;
-  gmtime_r(&tt, &tm);
-  char s[25];
-  strftime(s, sizeof s, "%Y-%m-%dT%H:%M:%SZ", &tm);
-  return String(s);
-}
-
-static const char *statusOf(uint8_t score)
-{
-  return score >= 75 ? "good" : score >= 50 ? "warning" : "bad";
-}
-
-static void loadConfig(NetConfig &cfg)
-{
-  Preferences p;
-  p.begin("net", true);
-  cfg.ssid = p.getString("ssid", "");
-  cfg.pass = p.getString("pass", "");
-  cfg.url = p.getString("url", "");
-  cfg.token = p.getString("token", "");
-  p.end();
-}
-
-// Kirim sampai MAX_PER_POST data tertua. Mengembalikan kode HTTP.
-static int upload(const NetConfig &cfg, const char *sessionId, uint32_t sessionStart, uint32_t slouchTotal)
-{
-  int count = min(pendingCount, MAX_PER_POST);
-  const Bucket &last = pending[pendingCount - 1].b;
-  uint32_t lastEnd = last.start + last.len;
-
-  String body;
-  body.reserve(200 + count * 190);
-  body += "{\"session\":{\"id\":\"" + String(sessionId) + "\",\"started_at\":\"" + iso(sessionStart) +
-          "\",\"ended_at\":\"" + iso(lastEnd) + "\",\"total_slouch_seconds\":" + String(slouchTotal) + "},\"readings\":[";
-  for (int i = 0; i < count; i++)
-  {
-    const Pending &p = pending[i];
-    if (i)
-      body += ",";
-    body += "{\"id\":\"" + String(p.id) + "\",\"timestamp\":\"" + iso(p.b.start) +
-            "\",\"avg_pitch_punggung\":" + String(p.b.back, 1) + ",\"avg_pitch_leher\":" + String(p.b.neck, 1) +
-            ",\"slouch_score\":" + String(p.b.score) + ",\"status\":\"" + statusOf(p.b.score) + "\"}";
-  }
-  body += "]}";
-
-  HTTPClient http;
-  WiFiClientSecure secure;
-  WiFiClient plain;
-  if (cfg.url.startsWith("https://"))
-  {
-    secure.setInsecure(); // PROTOTIPE: sertifikat server tidak diperiksa
-    http.begin(secure, cfg.url);
-  }
-  else
-  {
-    http.begin(plain, cfg.url); // untuk tes di jaringan lokal (http://192.168.x.x:3000)
-  }
-  http.setTimeout(10000);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", "Bearer " + cfg.token);
-  int code = http.POST(body);
-  http.end();
-
-  if (code >= 200 && code < 300)
-  {
-    memmove(pending, pending + count, (pendingCount - count) * sizeof(Pending));
-    pendingCount -= count;
-  }
-  return code;
-}
-
-static void uploadTask(void *)
-{
-  NetConfig cfg;
-  char sessionId[37];
-  uuid(sessionId); // satu sesi per nyala
-  uint32_t sessionStart = 0;
-  uint32_t slouchTotalMs = 0;
-  unsigned long connectStarted = 0, lastTry = 0;
-
-  for (;;)
-  {
-    if (reloadConfig)
-    {
-      reloadConfig = false;
-      loadConfig(cfg);
-      WiFi.disconnect(true);
-      if (cfg.ssid.length() && cfg.url.length() && cfg.token.length())
-      {
-        WiFi.mode(WIFI_STA);
-        WiFi.begin(cfg.ssid.c_str(), cfg.pass.c_str());
-        configTime(0, 0, "pool.ntp.org", "time.google.com");
-        connectStarted = millis();
-        lastTry = 0;
-        netState = NET_CONNECTING;
-      }
-      else
-      {
-        netState = NET_OFF;
-      }
-    }
-
-    Bucket b;
-    while (xQueueReceive(bucketQueue, &b, 0) == pdTRUE)
-    {
-      if (pendingCount == BUF_SIZE) // penuh: buang yang paling lama
-      {
-        memmove(pending, pending + 1, (BUF_SIZE - 1) * sizeof(Pending));
-        pendingCount--;
-      }
-      pending[pendingCount].b = b;
-      uuid(pending[pendingCount].id);
-      pendingCount++;
-      if (!sessionStart)
-        sessionStart = b.start;
-      slouchTotalMs += b.slouchMs;
-    }
-
-    if (netState == NET_OFF)
-    {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-
-    if (WiFi.status() != WL_CONNECTED || !clockReady())
-    {
-      // WiFi menyambung ulang sendiri; tandai gagal jika terlalu lama
-      if (millis() - connectStarted > 20000)
-        netState = NET_WIFI_FAIL;
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-    if (netState == NET_CONNECTING || netState == NET_WIFI_FAIL)
-      netState = NET_OK;
-
-    if (pendingCount > 0 && (lastTry == 0 || millis() - lastTry > (netState == NET_OK ? 0 : RETRY_MS)))
-    {
-      lastTry = millis();
-      int code = upload(cfg, sessionId, sessionStart, slouchTotalMs / 1000);
-      httpCode = code;
-      netState = (code >= 200 && code < 300) ? NET_OK : NET_HTTP_FAIL;
-    }
-    vTaskDelay(pdMS_TO_TICKS(250));
-  }
-}
-
-void begin()
-{
-  Preferences p;
-  p.begin("net", true);
-  intervalSec = p.getUShort("interval", DEFAULT_INTERVAL);
-  p.end();
-  bucketQueue = xQueueCreate(20, sizeof(Bucket));
-  xTaskCreatePinnedToCore(uploadTask, "cloud", 12288, nullptr, 1, nullptr, 0);
-}
-
-// ── Perintah & status ──────────────────────────────────────────────────────
-static String *fieldFor(char key)
-{
-  switch (key)
-  {
-  case 'S':
-    return &draft.ssid;
-  case 'P':
-    return &draft.pass;
-  case 'U':
-    return &draft.url;
-  case 'T':
-    return &draft.token;
-  }
-  return nullptr;
-}
-
-bool handleCommand(const String &raw)
-{
-  // Jangan trim/uppercase: SSID dan password peka huruf besar-kecil dan spasi
-  String cmd = raw;
-  while (cmd.endsWith("\n") || cmd.endsWith("\r"))
-    cmd.remove(cmd.length() - 1);
-
-  if (cmd.startsWith("WI="))
-  {
-    long v = cmd.substring(3).toInt();
-    if (v < 1 || v > 60)
-    {
-      logMsg("ERR: WI harus 1-60");
-      return true;
-    }
-    if (v != intervalSec)
-    {
-      intervalSec = v;
-      Preferences p;
-      p.begin("net", false);
-      p.putUShort("interval", v);
-      p.end();
-    }
-    logMsg("Interval: " + String(v) + " s");
-    return true;
-  }
-
-  if (cmd.length() >= 3 && cmd[0] == 'W' && (cmd[2] == '=' || cmd[2] == '+'))
-  {
-    String *field = fieldFor(cmd[1]);
-    if (!field)
-      return false;
-    if (cmd[2] == '=')
-      *field = "";
-    *field += cmd.substring(3);
-    return true;
-  }
-
-  String upper = cmd;
-  upper.trim();
-  upper.toUpperCase();
-  if (upper == "WIFI")
-  {
-    if (!draft.ssid.length() || !draft.url.length() || !draft.token.length())
-    {
-      logMsg("ERR: kirim WS=, WU=, WT= dulu");
-      return true;
-    }
-    Preferences p;
-    p.begin("net", false);
-    p.putString("ssid", draft.ssid);
-    p.putString("pass", draft.pass);
-    p.putString("url", draft.url);
-    p.putString("token", draft.token);
-    p.end();
-    draft = NetConfig();
-    reloadConfig = true;
-    reported = ""; // laporkan status baru walau sama
-    logMsg("WiFi tersimpan, menyambung...");
-    return true;
-  }
-  if (upper == "WIFI?")
-  {
-    forceReport = true;
-    return true;
-  }
-  if (upper == "WIFIOFF")
-  {
-    Preferences p;
-    p.begin("net", false);
-    p.clear();
-    p.end();
-    reloadConfig = true;
-    logMsg("WiFi dihapus");
-    return true;
-  }
-  return false;
-}
-
-void poll()
-{
-  String line;
-  switch (netState)
-  {
-  case NET_OFF:
-    line = "NET:OFF";
-    break;
-  case NET_CONNECTING:
-    line = "NET:CONNECTING";
-    break;
-  case NET_OK:
-    line = "NET:OK " + WiFi.localIP().toString();
-    break;
-  case NET_WIFI_FAIL:
-    line = "NET:FAIL wifi";
-    break;
-  case NET_HTTP_FAIL:
-    line = "NET:FAIL http " + String(httpCode);
-    break;
-  }
-  if (line != reported || forceReport)
-  {
-    reported = line;
-    forceReport = false;
-    logMsg(line);
-  }
-}
-} // namespace reallign_net
-
-void cloudBegin() { reallign_net::begin(); }
-void cloudSample(float back, float neck, float backRoll, bool motor) { reallign_net::sample(back, neck, backRoll, motor); }
-bool cloudHandleCommand(const String &cmd) { return reallign_net::handleCommand(cmd); }
-void cloudPoll() { reallign_net::poll(); }
