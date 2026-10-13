@@ -73,11 +73,15 @@ float slouchThreshold = 20.0;             // Jika miring lebih dari 20 derajat d
 unsigned long slouchDurationLimit = 3000; // Harus bungkuk selama 3 detik baru bergetar
 unsigned long slouchStartTime = 0;
 bool isSlouching = false;
+// Histeresis: sudah bungkuk dianggap selesai hanya jika di bawah (ambang - ini),
+// supaya getaran kecil di sekitar ambang tidak mereset timer bungkuk.
+const float SLOUCH_HYSTERESIS = 3.0;
 // alertActive = sedang bungkuk melewati batas waktu (dikirim ke aplikasi, selalu dihitung).
 // buzzerEnabled = buzzer boleh bunyi atau tidak. Default MATI; nyalakan dengan perintah ON.
 bool alertActive = false;
-bool buzzerEnabled = false;
+bool buzzerEnabled = true;
 bool buzzerOn = false;
+unsigned long alertStartTime = 0; // pola bunyi dimulai dari sini, jadi beep pertama langsung
 unsigned long buzzTestUntil = 0; // perintah BUZZ: bunyi tes sampai waktu ini
 
 // --- BLE: Nordic UART Service (NUS) ---
@@ -306,6 +310,8 @@ void setup()
 // ── Peringatan postur & buzzer ──────────────────────────────────────────────
 void setAlert(bool on)
 {
+  if (on && !alertActive)
+    alertStartTime = millis();
   alertActive = on;
   updateBuzzer();
 }
@@ -333,7 +339,7 @@ void updateBuzzer()
 {
   unsigned long now = millis();
   bool testing = (long)(buzzTestUntil - now) > 0;
-  bool beeping = buzzerEnabled && alertActive && (now % BEEP_PERIOD_MS) < BEEP_ON_MS;
+  bool beeping = buzzerEnabled && alertActive && ((now - alertStartTime) % BEEP_PERIOD_MS) < BEEP_ON_MS;
   writeBuzzer(testing || beeping);
 }
 
@@ -533,7 +539,9 @@ void loop()
   // Total kemiringan (depan/belakang + kiri/kanan) dibanding ambang batas
   float tilt1 = sqrtf(pitch1 * pitch1 + roll1 * roll1);
   float tilt2 = sqrtf(pitch2 * pitch2 + roll2 * roll2);
-  if (tilt1 > slouchThreshold || tilt2 > slouchThreshold)
+  // Mulai bungkuk saat melewati ambang; tetap bungkuk sampai turun di bawah (ambang - histeresis)
+  float limit = isSlouching ? slouchThreshold - SLOUCH_HYSTERESIS : slouchThreshold;
+  if (tilt1 > limit || tilt2 > limit)
   {
     if (!isSlouching)
     {
