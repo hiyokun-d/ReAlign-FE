@@ -63,6 +63,11 @@ export type Esp32Sample = {
 
 export type LogLine = { id: number; text: string };
 
+// Only one tab per browser should hold the sensor. Same channel name as
+// lib/esp32/ble.ts (can't import it: this folder is sealed).
+const TABS_CHANNEL = "reallign-ble";
+const CONNECT_ATTEMPTS = 4;
+
 export const HISTORY_SIZE = 600; // ~30 s at the firmware's 20 Hz
 const LOG_SIZE = 60;
 
@@ -151,6 +156,12 @@ export function useEsp32() {
     const bluetooth = (navigator as BluetoothNavigator).bluetooth;
     if (!bluetooth) return;
     setError(null);
+    // Ask other tabs to let go of the sensor while the user picks it.
+    if (typeof BroadcastChannel !== "undefined") {
+      const tabs = new BroadcastChannel(TABS_CHANNEL);
+      tabs.postMessage("release");
+      tabs.close();
+    }
 
     let device: BleDevice;
     try {
@@ -163,48 +174,72 @@ export function useEsp32() {
     }
 
     setStatus("connecting");
-    try {
-      deviceRef.current = device;
-      device.addEventListener("gattserverdisconnected", () => {
-        rxRef.current = null;
-        latestRef.current = null;
-        setCal(null);
-        setFwd(null);
-        setRgt(null);
-        setStatus((s) => (s === "connected" ? "idle" : s));
-        addLog("Disconnected");
-      });
+    deviceRef.current = device;
 
-      const server = await device.gatt!.connect();
-      const service = await server.getPrimaryService(NUS_SERVICE);
-      const tx = await service.getCharacteristic(NUS_TX);
-      rxRef.current = await service.getCharacteristic(NUS_RX);
+    // Notifications arrive in 20-byte chunks; rebuild whole lines.
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const onChunk = (value: DataView) => {
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed) handleLine(trimmed);
+      }
+    };
 
-      // Notifications arrive in 20-byte chunks; rebuild whole lines.
-      const decoder = new TextDecoder();
-      let buffer = "";
-      tx.addEventListener("characteristicvaluechanged", () => {
-        if (!tx.value) return;
-        buffer += decoder.decode(tx.value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed) handleLine(trimmed);
-        }
-      });
-      await tx.startNotifications();
-
-      setDeviceName(device.name ?? ESP32_NAME);
-      setHistory([]);
-      setStatus("connected");
-      addLog(`Connected to ${device.name ?? ESP32_NAME}`);
-      send("STATUS");
-    } catch (err) {
-      device.gatt?.disconnect();
-      setStatus("error");
-      setError(`Couldn't connect: ${(err as Error).message}`);
+    // Chrome often drops a fresh GATT connection ("GATT Server is disconnected.
+    // Cannot retrieve services"); a clean disconnect and another try usually works.
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= CONNECT_ATTEMPTS; attempt++) {
+      try {
+        addLog(`Bluetooth link… (try ${attempt} of ${CONNECT_ATTEMPTS})`);
+        const server = await device.gatt!.connect();
+        addLog("Link OK, finding sensor service…");
+        const service = await server.getPrimaryService(NUS_SERVICE);
+        const tx = await service.getCharacteristic(NUS_TX);
+        const rx = await service.getCharacteristic(NUS_RX);
+        addLog("Service OK, opening data channel…");
+        tx.addEventListener("characteristicvaluechanged", () => tx.value && onChunk(tx.value));
+        await tx.startNotifications();
+        rxRef.current = rx;
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err as Error;
+        device.gatt?.disconnect();
+        addLog(`! Dropped: ${lastError.message}`);
+        if (attempt < CONNECT_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+      }
     }
+    if (lastError) {
+      setStatus("error");
+      setError(
+        `Couldn't connect after ${CONNECT_ATTEMPTS} tries: ${lastError.message} Close other tabs/devices using the sensor, move closer, and check the Serial Monitor for a reboot.`
+      );
+      return;
+    }
+
+    // Only now: drops during the retries above aren't a real disconnect.
+    const tabs = typeof BroadcastChannel === "undefined" ? null : new BroadcastChannel(TABS_CHANNEL);
+    if (tabs) tabs.onmessage = (e) => e.data === "release" && device.gatt?.disconnect();
+    device.addEventListener("gattserverdisconnected", () => {
+      tabs?.close();
+      rxRef.current = null;
+      latestRef.current = null;
+      setCal(null);
+      setFwd(null);
+      setRgt(null);
+      setStatus((s) => (s === "connected" ? "idle" : s));
+      addLog("Disconnected");
+    });
+
+    setDeviceName(device.name ?? ESP32_NAME);
+    setHistory([]);
+    setStatus("connected");
+    addLog(`Connected to ${device.name ?? ESP32_NAME}. Waiting for data…`);
+    send("STATUS");
   }, [addLog, handleLine, send]);
 
   const disconnect = useCallback(() => {

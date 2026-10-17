@@ -12,8 +12,17 @@
 Adafruit_MPU6050 mpu1; // Sensor 1 (Punggung) -> Alamat I2C: 0x68
 Adafruit_MPU6050 mpu2; // Sensor 2 (Leher)    -> Alamat I2C: 0x69
 
-// Pin untuk Modul Motor Getar
-const int motorPin = 18;
+// Pin output
+const int buzzerPin = 18;   // Buzzer: peringatan postur (default MATI, nyalakan dengan ON)
+const int ledRedPin = 4;    // LED merah: belum tersambung Bluetooth
+const int ledGreenPin = 23; // LED hijau: tersambung Bluetooth
+
+// Buzzer aktif (berbunyi cukup dengan HIGH). Jika buzzer pasif, ubah jadi true (pakai tone()).
+const bool BUZZER_PASSIVE = false;
+const int BUZZER_TONE_HZ = 2000;
+// Pola bunyi saat bungkuk: 200 ms bunyi, 800 ms diam
+const unsigned long BEEP_PERIOD_MS = 1000;
+const unsigned long BEEP_ON_MS = 200;
 
 // Variabel untuk menyimpan sudut kemiringan saat ini
 // pitch = condong depan/belakang, roll = miring kiri/kanan (keduanya dari gravitasi)
@@ -64,8 +73,16 @@ float slouchThreshold = 20.0;             // Jika miring lebih dari 20 derajat d
 unsigned long slouchDurationLimit = 3000; // Harus bungkuk selama 3 detik baru bergetar
 unsigned long slouchStartTime = 0;
 bool isSlouching = false;
-bool alertEnabled = true; // Getaran bisa dimatikan dari HP
-bool motorOn = false;
+// Histeresis: sudah bungkuk dianggap selesai hanya jika di bawah (ambang - ini),
+// supaya getaran kecil di sekitar ambang tidak mereset timer bungkuk.
+const float SLOUCH_HYSTERESIS = 3.0;
+// alertActive = sedang bungkuk melewati batas waktu (dikirim ke aplikasi, selalu dihitung).
+// buzzerEnabled = buzzer boleh bunyi atau tidak. Default MATI; nyalakan dengan perintah ON.
+bool alertActive = false;
+bool buzzerEnabled = true;
+bool buzzerOn = false;
+unsigned long alertStartTime = 0; // pola bunyi dimulai dari sini, jadi beep pertama langsung
+unsigned long buzzTestUntil = 0; // perintah BUZZ: bunyi tes sampai waktu ini
 
 // --- BLE: Nordic UART Service (NUS) ---
 // Didukung oleh aplikasi: Adafruit Bluefruit Connect, Serial Bluetooth Terminal, nRF Connect
@@ -77,15 +94,33 @@ bool motorOn = false;
 BLEServer *bleServer = nullptr;
 BLECharacteristic *txChar = nullptr;
 bool bleConnected = false;
-bool bleWasConnected = false;
 
-// Perintah dari HP disimpan di sini lalu diproses di loop()
-// (jangan proses di callback BLE karena kalibrasi memakai delay)
-String pendingCmd = "";
-volatile bool cmdReady = false;
+// Beberapa HP/laptop boleh tersambung sekaligus, supaya operator selalu bisa masuk
+// lalu memutus yang lain dengan perintah KICK. Data dikirim ke semua yang tersambung.
+const int MAX_PEERS = 3;
+const uint16_t NO_PEER = 0xFFFF;
+volatile uint16_t peerIds[MAX_PEERS] = {NO_PEER, NO_PEER, NO_PEER};
+volatile int peerCount = 0;
+int reportedPeers = -1;
+portMUX_TYPE peerMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Perintah dari HP masuk antrean lalu diproses di loop()
+// (jangan proses di callback BLE karena kalibrasi memakai delay).
+// Antrean, bukan satu variabel: beberapa perintah bisa datang beruntun dengan cepat.
+struct CmdItem
+{
+  char text[64];
+  uint16_t from; // conn_id pengirim (untuk KICK)
+};
+uint16_t cmdFrom = NO_PEER; // pengirim perintah yang sedang diproses
+QueueHandle_t cmdQueue = nullptr;
 
 bool calibrateSensors(int countdownSec, bool force);
-void setMotor(bool on);
+void setAlert(bool on);
+void updateBuzzer();
+void updateLeds();
+void setLeds(bool red, bool green);
+void blinkErrorForever();
 void loadBaseline();
 void saveBaseline();
 void setForward();
@@ -97,28 +132,75 @@ float pitchOf(const Vec3 &v);
 float rollOf(const Vec3 &v);
 float wrap180(float deg);
 void bleSend(const String &msg);
+void logMsg(const String &msg);
 void handleCommand(String cmd);
 
 class ServerCallbacks : public BLEServerCallbacks
 {
-  void onConnect(BLEServer *server) override
+  void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override
   {
+    portENTER_CRITICAL(&peerMux);
+    for (int i = 0; i < MAX_PEERS; i++)
+    {
+      if (peerIds[i] == NO_PEER)
+      {
+        peerIds[i] = param->connect.conn_id;
+        peerCount++;
+        break;
+      }
+    }
+    int count = peerCount;
+    portEXIT_CRITICAL(&peerMux);
     bleConnected = true;
+    // Tetap beriklan supaya perangkat lain (operator) masih bisa masuk
+    if (count < MAX_PEERS)
+      BLEDevice::startAdvertising();
   }
-  void onDisconnect(BLEServer *server) override
+  void onDisconnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override
   {
-    bleConnected = false;
+    portENTER_CRITICAL(&peerMux);
+    for (int i = 0; i < MAX_PEERS; i++)
+    {
+      if (peerIds[i] == param->disconnect.conn_id)
+      {
+        peerIds[i] = NO_PEER;
+        peerCount--;
+        break;
+      }
+    }
+    bleConnected = peerCount > 0;
+    portEXIT_CRITICAL(&peerMux);
   }
 };
 
+// Putus semua koneksi BLE kecuali pengirim perintah
+void kickOthers(uint16_t keep)
+{
+  uint16_t ids[MAX_PEERS];
+  portENTER_CRITICAL(&peerMux);
+  for (int i = 0; i < MAX_PEERS; i++)
+    ids[i] = peerIds[i];
+  portEXIT_CRITICAL(&peerMux);
+  int kicked = 0;
+  for (int i = 0; i < MAX_PEERS; i++)
+  {
+    if (ids[i] != NO_PEER && ids[i] != keep)
+    {
+      bleServer->disconnect(ids[i]);
+      kicked++;
+    }
+  }
+  logMsg("KICK:" + String(kicked));
+}
+
 class RxCallbacks : public BLECharacteristicCallbacks
 {
-  void onWrite(BLECharacteristic *chr) override
+  void onWrite(BLECharacteristic *chr, esp_ble_gatts_cb_param_t *param) override
   {
-    if (cmdReady)
-      return; // Perintah sebelumnya belum diproses
-    pendingCmd = String(chr->getValue().c_str());
-    cmdReady = true;
+    CmdItem item = {};
+    strncpy(item.text, chr->getValue().c_str(), sizeof(item.text) - 1);
+    item.from = param->write.conn_id;
+    xQueueSend(cmdQueue, &item, 0); // antrean penuh = perintah dibuang
   }
 };
 
@@ -172,12 +254,18 @@ void logMsg(const String &msg)
 void setup()
 {
   Serial.begin(115200);
-  pinMode(motorPin, OUTPUT);
-  digitalWrite(motorPin, LOW);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+  pinMode(ledRedPin, OUTPUT);
+  pinMode(ledGreenPin, OUTPUT);
+  setLeds(true, true); // tes LED saat nyala
+  delay(300);
+  setLeds(true, false);
 
   Wire.begin();
   Wire.setClock(100000); // Menjaga kestabilan I2C
 
+  cmdQueue = xQueueCreate(24, sizeof(CmdItem));
   setupBLE();
 
   Serial.println("Memulai Inisialisasi Sensor...");
@@ -186,10 +274,7 @@ void setup()
   if (!mpu1.begin(0x68))
   {
     Serial.println("GAGAL: Sensor Punggung (0x68) tidak ditemukan!");
-    while (1)
-    {
-      delay(10);
-    }
+    blinkErrorForever();
   }
   Serial.println("OK: Sensor Punggung Ditemukan!");
 
@@ -197,10 +282,7 @@ void setup()
   if (!mpu2.begin(0x69))
   {
     Serial.println("GAGAL: Sensor Leher (0x69) tidak ditemukan!");
-    while (1)
-    {
-      delay(10);
-    }
+    blinkErrorForever();
   }
   Serial.println("OK: Sensor Leher Ditemukan!");
 
@@ -225,10 +307,71 @@ void setup()
   }
 }
 
-void setMotor(bool on)
+// ── Peringatan postur & buzzer ──────────────────────────────────────────────
+void setAlert(bool on)
 {
-  motorOn = on;
-  digitalWrite(motorPin, on ? HIGH : LOW);
+  if (on && !alertActive)
+    alertStartTime = millis();
+  alertActive = on;
+  updateBuzzer();
+}
+
+void writeBuzzer(bool on)
+{
+  if (on == buzzerOn)
+    return;
+  buzzerOn = on;
+  if (BUZZER_PASSIVE)
+  {
+    if (on)
+      tone(buzzerPin, BUZZER_TONE_HZ);
+    else
+      noTone(buzzerPin);
+  }
+  else
+  {
+    digitalWrite(buzzerPin, on ? HIGH : LOW);
+  }
+}
+
+// Dipanggil tiap loop: bunyi berpola saat bungkuk (jika diaktifkan), atau bunyi tes BUZZ
+void updateBuzzer()
+{
+  unsigned long now = millis();
+  bool testing = (long)(buzzTestUntil - now) > 0;
+  bool beeping = buzzerEnabled && alertActive && ((now - alertStartTime) % BEEP_PERIOD_MS) < BEEP_ON_MS;
+  writeBuzzer(testing || beeping);
+}
+
+// ── LED status Bluetooth ────────────────────────────────────────────────────
+//   merah berkedip pelan  = menunggu HP/laptop tersambung
+//   hijau menyala         = tersambung
+//   merah + hijau menyala = sedang kalibrasi
+//   merah berkedip cepat  = sensor MPU6050 tidak ditemukan (cek kabel)
+void setLeds(bool red, bool green)
+{
+  digitalWrite(ledRedPin, red ? HIGH : LOW);
+  digitalWrite(ledGreenPin, green ? HIGH : LOW);
+}
+
+void updateLeds()
+{
+  if (peerCount > 0)
+    setLeds(false, true);
+  else
+    setLeds((millis() / 500) % 2 == 0, false);
+}
+
+void blinkErrorForever()
+{
+  writeBuzzer(false);
+  while (1)
+  {
+    setLeds(true, false);
+    delay(100);
+    setLeds(false, false);
+    delay(100);
+  }
 }
 
 // Daftar perintah dari HP (kirim sebagai teks):
@@ -238,9 +381,11 @@ void setMotor(bool on)
 //   RGT      -> miringkan badan + kepala ke KANAN lalu kirim: miring kanan jadi positif
 //   T=25     -> ubah ambang batas sudut (derajat)
 //   D=5000   -> ubah durasi bungkuk sebelum getar (ms)
-//   ON / OFF -> aktifkan / matikan getaran
-//   BUZZ     -> tes motor getar 0.5 detik
+//   ON / OFF -> nyalakan / matikan buzzer peringatan (default MATI)
+//   BUZZ     -> tes buzzer 0.5 detik (bunyi walau buzzer dimatikan)
 //   STATUS   -> tampilkan pengaturan saat ini
+//   KICK     -> putuskan semua HP/laptop lain yang tersambung (selain pengirim)
+// Semua perintah juga bisa diketik di Serial Monitor (lewat kabel USB).
 void handleCommand(String cmd)
 {
   cmd.trim();
@@ -296,56 +441,84 @@ void handleCommand(String cmd)
   }
   else if (cmd == "ON")
   {
-    alertEnabled = true;
-    logMsg("Getaran: ON");
+    buzzerEnabled = true;
+    logMsg("Buzzer: ON");
   }
   else if (cmd == "OFF")
   {
-    alertEnabled = false;
-    setMotor(false);
-    logMsg("Getaran: OFF");
+    buzzerEnabled = false;
+    updateBuzzer();
+    logMsg("Buzzer: OFF");
   }
   else if (cmd == "BUZZ")
   {
-    setMotor(true);
-    delay(500);
-    setMotor(false);
-    logMsg("Tes motor selesai");
+    buzzTestUntil = millis() + 500; // tanpa delay, loop jalan terus
+    updateBuzzer();
+    logMsg("Tes buzzer");
+  }
+  else if (cmd == "KICK")
+  {
+    kickOthers(cmdFrom);
   }
   else if (cmd == "STATUS")
   {
     logMsg("T=" + String(slouchThreshold, 1) + " D=" + String(slouchDurationLimit) +
-           " Getar=" + (alertEnabled ? "ON" : "OFF") +
+           " Buzzer=" + (buzzerEnabled ? "ON" : "OFF") +
            " Nol=" + String(baselinePitch1, 1) + "," + String(baselinePitch2, 1) +
            " Arah=" + String(dir1) + "," + String(dir2) +
            " ArahR=" + String(rdir1) + "," + String(rdir2));
   }
   else
   {
-    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS");
+    logMsg("Perintah: CAL, CAL=n, FWD, RGT, T=, D=, ON, OFF, BUZZ, STATUS, KICK");
   }
 }
 
 void loop()
 {
-  // Iklan ulang setelah HP terputus agar bisa tersambung lagi
-  if (!bleConnected && bleWasConnected)
+  // Jumlah HP/laptop tersambung berubah: laporkan (PEERS:n) dan iklan ulang
+  // jika ada slot kosong, supaya bisa tersambung lagi
+  int peers = peerCount;
+  if (peers != reportedPeers)
   {
-    delay(300);
-    BLEDevice::startAdvertising();
-    Serial.println("BLE terputus, iklan ulang...");
+    if (peers < reportedPeers && peers < MAX_PEERS)
+    {
+      delay(300);
+      BLEDevice::startAdvertising();
+      Serial.println("BLE terputus, iklan ulang...");
+    }
+    if (peers > reportedPeers && reportedPeers >= 0)
+      Serial.println("BLE tersambung!");
+    reportedPeers = peers;
+    logMsg("PEERS:" + String(peers));
   }
-  if (bleConnected && !bleWasConnected)
-  {
-    Serial.println("BLE tersambung!");
-  }
-  bleWasConnected = bleConnected;
 
-  if (cmdReady)
+  CmdItem item;
+  while (xQueueReceive(cmdQueue, &item, 0) == pdTRUE)
   {
-    String cmd = pendingCmd;
-    cmdReady = false;
-    handleCommand(cmd);
+    cmdFrom = item.from;
+    handleCommand(String(item.text));
+  }
+
+  // Perintah juga bisa lewat kabel USB (Serial Monitor, 115200, akhiri dengan Enter).
+  // Berguna saat BLE bermasalah, mis. kirim STATUS atau KICK.
+  static String serialLine;
+  while (Serial.available())
+  {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r')
+    {
+      if (serialLine.length())
+      {
+        cmdFrom = NO_PEER;
+        handleCommand(serialLine);
+        serialLine = "";
+      }
+    }
+    else if (serialLine.length() < 63)
+    {
+      serialLine += c;
+    }
   }
 
   readSensors();
@@ -366,7 +539,9 @@ void loop()
   // Total kemiringan (depan/belakang + kiri/kanan) dibanding ambang batas
   float tilt1 = sqrtf(pitch1 * pitch1 + roll1 * roll1);
   float tilt2 = sqrtf(pitch2 * pitch2 + roll2 * roll2);
-  if (tilt1 > slouchThreshold || tilt2 > slouchThreshold)
+  // Mulai bungkuk saat melewati ambang; tetap bungkuk sampai turun di bawah (ambang - histeresis)
+  float limit = isSlouching ? slouchThreshold - SLOUCH_HYSTERESIS : slouchThreshold;
+  if (tilt1 > limit || tilt2 > limit)
   {
     if (!isSlouching)
     {
@@ -375,22 +550,26 @@ void loop()
     }
     else
     {
-      if (alertEnabled && !motorOn && millis() - slouchStartTime > slouchDurationLimit)
+      // Peringatan selalu dihitung (untuk data di aplikasi); buzzer hanya bunyi jika ON
+      if (!alertActive && millis() - slouchStartTime > slouchDurationLimit)
       {
         logMsg("PERINGATAN: Postur memburuk!");
-        setMotor(true);
+        setAlert(true);
       }
     }
   }
   else
   {
     isSlouching = false;
-    setMotor(false);
+    setAlert(false);
   }
+  updateBuzzer();
+  updateLeds();
 
-  // Kirim data ke HP format CSV: punggung,leher,motor,rollPunggung,rollLeher
+  // Kirim data ke HP format CSV: punggung,leher,peringatan,rollPunggung,rollLeher
+  // (kolom ke-3 = 1 saat peringatan bungkuk aktif, walau buzzer dimatikan)
   // (format ini langsung bisa digambar di menu Plotter aplikasi Bluefruit Connect)
-  bleSend(String(pitch1, 1) + "," + String(pitch2, 1) + "," + String(motorOn ? 1 : 0) + "," +
+  bleSend(String(pitch1, 1) + "," + String(pitch2, 1) + "," + String(alertActive ? 1 : 0) + "," +
           String(roll1, 1) + "," + String(roll2, 1) + "\n");
 
   delay(LOOP_MS);
@@ -537,8 +716,9 @@ void setRight()
 //   CAL:FAIL x       bergerak x derajat, titik nol lama dipakai
 bool calibrateSensors(int countdownSec, bool force)
 {
-  setMotor(false);
+  setAlert(false);
   isSlouching = false;
+  setLeds(true, true); // merah + hijau = sedang kalibrasi (loop berhenti selama ini)
 
   for (int s = countdownSec; s > 0; s--)
   {

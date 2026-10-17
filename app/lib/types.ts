@@ -30,6 +30,14 @@ export type PostureSession = {
   slouchCount: number
   /** Minutes spent in "good" posture. */
   goodMinutes: number
+  /** How long the slouch alert was on (posture_sessions.total_slouch_seconds). */
+  slouchSeconds: number
+}
+
+/** A session plus every posture_readings row it recorded (the session's log). */
+export type SessionDetail = {
+  session: PostureSession
+  readings: PostureReading[]
 }
 
 export type Device = {

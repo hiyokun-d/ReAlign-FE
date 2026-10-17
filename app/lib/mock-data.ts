@@ -54,6 +54,7 @@ export const mockSessions: PostureSession[] = [
     averageScore: 72,
     slouchCount: 4,
     goodMinutes: 38,
+    slouchSeconds: 160,
   },
   {
     id: "s-2",
@@ -62,6 +63,7 @@ export const mockSessions: PostureSession[] = [
     averageScore: 81,
     slouchCount: 6,
     goodMinutes: 170,
+    slouchSeconds: 240,
   },
   {
     id: "s-1",
@@ -70,6 +72,7 @@ export const mockSessions: PostureSession[] = [
     averageScore: 64,
     slouchCount: 11,
     goodMinutes: 88,
+    slouchSeconds: 420,
   },
 ]
 
