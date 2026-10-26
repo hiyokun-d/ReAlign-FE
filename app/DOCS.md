@@ -756,7 +756,7 @@ List problems by file with a one-line fix each. Then run `bun run lint` and
 | Other hydration errors | `Math.random()`, `Date.now()` or `new Date()` during render | Move it into `useEffect`, or do it on the server and pass the result as a prop |
 | "No data yet" / "No sensor yet" on another browser or phone | Each browser is its own anonymous user | Expected. Watch from other devices via the **QR code** on `/device` |
 | Dashboard doesn't update by itself | Pages load data once per visit | Refresh, or see the auto-refresh idea in section 18 |
-| "Connect sensor" is greyed out | Browser has no Bluetooth (Safari, Firefox, or not on localhost/https) | Use Chrome or Edge on `http://localhost:3000` |
+| "Connect sensor" is greyed out | Browser has no Bluetooth (Safari, Firefox, or not on localhost/https) | Use Chrome or Edge on `http://localhost:3000`. On another device (opened by IP, e.g. `http://172.20.10.2:3000`), run `bun run dev:https` and open `https://<ip>:3000` instead; accept the certificate warning once (Advanced → Proceed) |
 | Pairing fails at "Bluetooth link" | Another tab or device holds the sensor, or it's off or out of range | Close other tabs (incl. `/demo`), press **Disconnect everyone else**, move closer, power-cycle the sensor |
 | Phone can't open the QR link | The link says `localhost` | Enter the laptop's network address (shown as "Network" when you run `bun dev`) |
 | Score is always 0 / "Bad" | Sensor not calibrated for how it's worn | Ask IoT to recalibrate (`CAL`, then `FWD`, `RGT`) |
